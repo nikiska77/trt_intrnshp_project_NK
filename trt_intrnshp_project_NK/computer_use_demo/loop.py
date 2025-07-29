@@ -6,8 +6,15 @@ import platform
 from collections.abc import Callable
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, cast
-
+from typing import Any, cast, Callable, List
+import openai
+from openai import OpenAI
+import os
+import requests
+import base64
+import json
+from dotenv import load_dotenv
+# from computer_use_demo.nebius_config import nebius_config
 import httpx
 from anthropic import (
     Anthropic,
@@ -43,6 +50,7 @@ class APIProvider(StrEnum):
     ANTHROPIC = "anthropic"
     BEDROCK = "bedrock"
     VERTEX = "vertex"
+    NEBIUS = "nebius"
 
 
 # This system prompt is optimized for the Docker environment in this repository and
@@ -65,6 +73,62 @@ SYSTEM_PROMPT = f"""<SYSTEM_CAPABILITY>
 * When using Firefox, if a startup wizard appears, IGNORE IT.  Do not even click "skip this step".  Instead, click on the address bar where it says "Search or enter address", and enter the appropriate search term or URL there.
 * If the item you are looking at is a pdf, if after taking a single screenshot of the pdf it seems that you want to read the entire document instead of trying to continue to read the pdf from your screenshots + navigation, determine the URL, use curl to download the pdf, install and use pdftotext to convert it to a text file, and then read that text file directly with your str_replace_based_edit_tool.
 </IMPORTANT>"""
+
+
+# Client initialization for  Nebius AI
+def init_nebius_client():
+    # load_dotenv()
+    api_key = os.getenv("NEBIUS_API_KEY")
+    if not api_key:
+        raise ValueError("Missing Nebius API credentials. Check your .env file")
+    # print(api_key)
+    return OpenAI(
+        api_key=api_key,
+        # base_url=os.getenv("BASE_URL"),
+        base_url="https://api.studio.nebius.com/v1/",
+    )
+def test_nebius_connection():
+    client = init_nebius_client()
+    try:
+        response = client.models.list()
+        print("Connection successful. Available models:", [m.id for m in response.data])
+    except Exception as e:
+        print("Connection failed:", str(e))
+
+
+def convert_messages(system_prompt: str, messages: List[BetaMessageParam]):
+    result = [{"role": "system", "content": system_prompt}]
+    for msg in messages:
+        role = msg["role"]
+        content = msg["content"]
+        if isinstance(content, list):
+            texts = [block["text"] for block in content if block["type"] == "text"]
+            text = "\n".join(texts)
+        else:
+            text = content
+        result.append({"role": role, "content": text})
+    return result
+
+
+def convert_tools_for_openai(tool_collection: ToolCollection):
+    tools = []
+    for tool in tool_collection.tools:
+        schema = getattr(tool, "json_schema", None)
+        if schema is None:
+            continue
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": getattr(tool, "description", "No description provided."),
+                "parameters": schema.get("parameters", {})
+            }
+        })
+    return tools
+
+
+def convert_tool_call_to_result(tool_call):
+    return tool_call.function.name, json.loads(tool_call.function.arguments)
 
 
 async def sampling_loop(
@@ -101,6 +165,104 @@ async def sampling_loop(
         if token_efficient_tools_beta:
             betas.append("token-efficient-tools-2025-02-19")
         image_truncation_threshold = only_n_most_recent_images or 0
+        extra_body = {}
+        if thinking_budget:
+            # Ensure we only send the required fields for thinking
+            extra_body = {
+                "thinking": {"type": "enabled", "budget_tokens": thinking_budget}
+            }
+
+        if provider == APIProvider.NEBIUS:  # I added this code
+            client = init_nebius_client()
+            # model = "Qwen/Qwen2-VL-72B-Instruct"
+            model= "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
+            converted_messages = convert_messages(system["text"], messages) # Messages conversion to OpenAI format
+            openai_tools = convert_tools_for_openai(tool_collection)
+            print(openai_tools)
+            try:
+                # step 1 without tools
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=converted_messages,
+                    max_tokens=max_tokens,
+                    temperature=0.3,
+                    # stream=True,
+                    tools=openai_tools,
+                    tool_choice="auto",
+                )
+                choice = response.choices[0]
+                # print(response.choices[0].message.content)
+
+                # Tool call response
+                tool_result_content: list[BetaToolResultBlockParam] = []
+                if hasattr(choice.message, "tool_calls"):
+                    for tool_call in choice.message.tool_calls:
+                        tool_name, tool_input = convert_tool_call_to_result(tool_call)
+                        tool_id = tool_call.id
+                        result = await tool_collection.run(name=tool_name, tool_input=tool_input)
+                        tool_output_callback(result, tool_id)
+                        tool_result_content.append(
+                            _make_api_tool_result(result, tool_id)
+                        )
+                    print('toolresultcontent', tool_result_content)
+
+                    if tool_result_content:
+                        messages.append({"role": "assistant", "content":[
+                                            {
+                                                "type": "tool_use",
+                                                "name": c.function.name,
+                                                "input": json.loads(c.function.arguments),
+                                                "id": c.id
+                                            } for c in choice.message.tool_calls
+                                         ]})
+                        messages.append({"role": "user", "content": tool_result_content})
+                        continue
+                # Text response
+                if choice.message.content:
+                    block = BetaTextBlockParam(type="text", text=choice.message.content)
+                    output_callback(block)
+                    messages.append({"role": "assistant", "content": [block]})
+
+                return messages
+
+            except Exception as e:
+                api_response_callback(None, None, e)
+                return messages
+
+                # if response.choices and response.choices[0].message.content:
+                #     return response.choices[0].message.content
+                # return "Received empty response from Nebius API"
+            #     for chunk in response:
+            #         delta = chunk.choices[0].delta
+            #         if "content" in delta:
+            #             full_response_text += delta["content"]
+            #             block = BetaTextBlockParam(type="text", text=delta["content"])
+            #             output_callback(block)
+            #     messages.append({
+            #         "role": "assistant",
+            #         "content": [BetaTextBlockParam(type="text", text=full_response_text)],
+            #     })
+            #     print(messages)
+            #     return messages
+            # except client.PermissionDeniedError as e:
+            #     print(f"Permission denied: {e}")
+            #     raise ValueError("Check your Nebius API key and permissions")
+            #
+            # except client.APIError as e:
+            #     print(f"Nebius API error: {e}")
+            #     raise
+
+
+        # Call the API
+        # we use raw_response to provide debug information to streamlit. Your
+        # implementation may be able call the SDK directly with:
+        # `response = client.messages.create(...)` instead.
+
+        # print("Sending to Nebius:", json.dumps(openai_messages, indent=2))
+        # print("Tools:", tool_collection.to_params())
+        # test_nebius_connection()
+
+            # return response.choices[0].message.content
         if provider == APIProvider.ANTHROPIC:
             client = Anthropic(api_key=api_key, max_retries=4)
             enable_prompt_caching = True
@@ -124,27 +286,17 @@ async def sampling_loop(
                 only_n_most_recent_images,
                 min_removal_threshold=image_truncation_threshold,
             )
-        extra_body = {}
-        if thinking_budget:
-            # Ensure we only send the required fields for thinking
-            extra_body = {
-                "thinking": {"type": "enabled", "budget_tokens": thinking_budget}
-            }
 
-        # Call the API
-        # we use raw_response to provide debug information to streamlit. Your
-        # implementation may be able call the SDK directly with:
-        # `response = client.messages.create(...)` instead.
         try:
             raw_response = client.beta.messages.with_raw_response.create(
-                max_tokens=max_tokens,
-                messages=messages,
-                model=model,
-                system=[system],
-                tools=tool_collection.to_params(),
-                betas=betas,
-                extra_body=extra_body,
-            )
+                    max_tokens=max_tokens,
+                    messages=messages,
+                    model=model,
+                    system=[system],
+                    tools=tool_collection.to_params(),
+                    betas=betas,
+                    extra_body=extra_body,
+                )
         except (APIStatusError, APIResponseValidationError) as e:
             api_response_callback(e.request, e.response, e)
             return messages

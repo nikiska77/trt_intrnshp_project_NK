@@ -35,6 +35,8 @@ PROVIDER_TO_DEFAULT_MODEL_NAME: dict[APIProvider, str] = {
     APIProvider.ANTHROPIC: "claude-sonnet-4-20250514",
     APIProvider.BEDROCK: "anthropic.claude-3-5-sonnet-20241022-v2:0",
     APIProvider.VERTEX: "claude-3-5-sonnet-v2@20241022",
+    # APIProvider.NEBIUS: "Qwen/Qwen2.5-VL-72B-Instruct",
+    APIProvider.NEBIUS: "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
 }
 
 
@@ -66,11 +68,29 @@ CLAUDE_4 = ModelConfig(
     has_thinking=True,
 )
 
+NEBIUS_QWEN_VL_72B = ModelConfig(
+    tool_version="computer_use_20250124",
+    max_output_tokens=32_000,
+    default_output_tokens=4_096,
+    has_thinking=False,
+)
+
+NEBIUS_MISTRAL_VL = ModelConfig(
+#     mistralai/Mistral-Small-3.1-24B-Instruct-2503
+    tool_version="computer_use_20250124",
+    max_output_tokens=32_000,
+    default_output_tokens=4_096,
+    has_thinking=False,
+
+)
+
 MODEL_TO_MODEL_CONF: dict[str, ModelConfig] = {
     "claude-3-7-sonnet-20250219": SONNET_3_7,
     "claude-opus-4@20250508": CLAUDE_4,
     "claude-sonnet-4-20250514": CLAUDE_4,
     "claude-opus-4-20250514": CLAUDE_4,
+    "Qwen/Qwen2.5-VL-72B-Instruct": NEBIUS_QWEN_VL_72B,
+    "mistralai/Mistral-Small-3.1-24B-Instruct-2503": NEBIUS_MISTRAL_VL,
 }
 
 CONFIG_DIR = PosixPath("~/.anthropic").expanduser()
@@ -201,7 +221,13 @@ async def main():
                 key="api_key",
                 on_change=lambda: save_to_storage("api_key", st.session_state.api_key),
             )
-
+        if st.session_state.provider == APIProvider.NEBIUS:
+            st.text_input(
+                "Nebius API Key",
+                type="password",
+                key="api_key",
+                on_change=lambda: save_to_storage("api_key", st.session_state.api_key),
+            )
         st.number_input(
             "Only send N most recent images",
             min_value=0,
@@ -389,6 +415,12 @@ def validate_auth(provider: APIProvider, api_key: str | None):
             )
         except DefaultCredentialsError:
             return "Your google cloud credentials are not set up correctly."
+
+    if provider == APIProvider.NEBIUS:
+        if not api_key:
+            return "Enter your Nebius API key in the sidebar to continue."
+        # if not os.getenv("NEBIUS_FOLDER_ID"):
+        #     return "You must set the NEBIUS_FOLDER_ID environment variable."
 
 
 def load_from_storage(filename: str) -> str | None:
