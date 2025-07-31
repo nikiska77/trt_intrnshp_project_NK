@@ -13,7 +13,7 @@ import os
 import requests
 import base64
 import json
-from dotenv import load_dotenv
+import re
 # from computer_use_demo.nebius_config import nebius_config
 import httpx
 from anthropic import (
@@ -42,6 +42,7 @@ from .tools import (
     ToolResult,
     ToolVersion,
 )
+from tools.bashnebius import NebiusBashTool
 
 PROMPT_CACHING_BETA_FLAG = "prompt-caching-2024-07-31"
 
@@ -59,7 +60,7 @@ class APIProvider(StrEnum):
 # environment it is running in, and to provide any additional information that may be
 # helpful for the task at hand.
 SYSTEM_PROMPT = f"""<SYSTEM_CAPABILITY>
-* You are utilising an Ubuntu virtual machine using {platform.machine()} architecture with internet access.
+* You are utilising an Ubuntu virtual machine using {platform.machine()} architecture with internet access. You use tools by writing bash code inside ```bash blocks. Use bash syntax only for tool invocation.
 * You can feel free to install Ubuntu applications with your bash tool. Use curl instead of wget.
 * To open firefox, please just click on the firefox icon.  Note, firefox-esr is what is installed on your system.
 * Using bash tool you can start GUI applications, but you need to set export DISPLAY=:1 and use a subshell. For example "(DISPLAY=:1 xterm &)". GUI apps run with bash tool will appear within your desktop environment, but they may take some time to appear. Take a screenshot to confirm it did.
@@ -110,21 +111,16 @@ def convert_messages(system_prompt: str, messages: List[BetaMessageParam]):
     return result
 
 
-def convert_tools_for_openai(tool_collection: ToolCollection):
-    tools = []
-    for tool in tool_collection.tools:
-        schema = getattr(tool, "json_schema", None)
-        if schema is None:
-            continue
-        tools.append({
-            "type": "function",
-            "function": {
-                "name": tool.name,
-                "description": getattr(tool, "description", "No description provided."),
-                "parameters": schema.get("parameters", {})
-            }
-        })
-    return tools
+def convert_tool_use_blocks(tool_uses: list[dict[str, Any]]) -> list[BetaToolResultBlockParam]:
+    return [
+        BetaToolResultBlockParam(
+            tool_use_id=tool_use["id"],
+            type="tool_result",
+            content=tool_use["result"].output if tool_use["result"].output else tool_use["result"].error,
+            is_error=bool(tool_use["result"].error),
+        )
+        for tool_use in tool_uses
+    ]
 
 
 def convert_tool_call_to_result(tool_call):
@@ -154,6 +150,12 @@ async def sampling_loop(
     """
     tool_group = TOOL_GROUPS_BY_VERSION[tool_version]
     tool_collection = ToolCollection(*(ToolCls() for ToolCls in tool_group.tools))
+    print("Active tools:", list(tool_collection.tool_map.keys()))
+    tools_nebius = [
+        # NebiusComputerTool(),
+        # NebiusEditTool(),
+        NebiusBashTool()
+    ]
     system = BetaTextBlockParam(
         type="text",
         text=f"{SYSTEM_PROMPT}{' ' + system_prompt_suffix if system_prompt_suffix else ''}",
@@ -173,58 +175,63 @@ async def sampling_loop(
             }
 
         if provider == APIProvider.NEBIUS:  # I added this code
-            client = init_nebius_client()
-            # model = "Qwen/Qwen2-VL-72B-Instruct"
-            model= "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
+            model = "Qwen/Qwen2.5-VL-72B-Instruct"
+            # model= "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
             converted_messages = convert_messages(system["text"], messages) # Messages conversion to OpenAI format
-            openai_tools = convert_tools_for_openai(tool_collection)
-            print(openai_tools)
+            # openai_tools = convert_tools_for_openai(tool_collection)
+            # print(tool_collection)
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            }
+            body = {
+                "model": model,
+                "messages": converted_messages,
+                "max_tokens": max_tokens,
+                "temperature": 0.3,
+                "tools": [tool.to_params() for tool in tools_nebius],
+                "tool_choice": "auto",
+                "stream": False,
+            }
+
             try:
-                # step 1 without tools
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=converted_messages,
-                    max_tokens=max_tokens,
-                    temperature=0.3,
-                    # stream=True,
-                    tools=openai_tools,
-                    tool_choice="auto",
-                )
-                choice = response.choices[0]
-                # print(response.choices[0].message.content)
+                async with httpx.AsyncClient() as client:
+                    r = await client.post("https://api.studio.nebius.com/v1/chat/completions", headers=headers,
+                                          json=body)
+                    api_response_callback(r.request, r, None)
+                    print("Nebius raw response:", r.text)
+                    data = r.json()
 
-                # Tool call response
-                tool_result_content: list[BetaToolResultBlockParam] = []
-                if hasattr(choice.message, "tool_calls"):
-                    for tool_call in choice.message.tool_calls:
-                        tool_name, tool_input = convert_tool_call_to_result(tool_call)
-                        tool_id = tool_call.id
-                        result = await tool_collection.run(name=tool_name, tool_input=tool_input)
-                        tool_output_callback(result, tool_id)
-                        tool_result_content.append(
-                            _make_api_tool_result(result, tool_id)
-                        )
-                    print('toolresultcontent', tool_result_content)
-
-                    if tool_result_content:
-                        messages.append({"role": "assistant", "content":[
-                                            {
-                                                "type": "tool_use",
-                                                "name": c.function.name,
-                                                "input": json.loads(c.function.arguments),
-                                                "id": c.id
-                                            } for c in choice.message.tool_calls
-                                         ]})
-                        messages.append({"role": "user", "content": tool_result_content})
-                        continue
-                # Text response
-                if choice.message.content:
-                    block = BetaTextBlockParam(type="text", text=choice.message.content)
+                    choice = data["choices"][0]
+                    assistant_content = choice.get("message", {}).get("content")
+                    if not assistant_content:
+                        return messages
+                    block = BetaTextBlockParam(type="text", text=assistant_content)
                     output_callback(block)
                     messages.append({"role": "assistant", "content": [block]})
+                    print(tool_collection.tools)
+                    # try extract tool_use manually from generated response if exists
+                    # check if there's a bash command to simulate tool call
+                    # match = re.search(r"```bash\\n(.+?)\\n```", assistant_content, re.DOTALL)
+                    match = re.search(r"```bash\s*\n(.*?)\n```", assistant_content, re.DOTALL)
 
-                return messages
+                    if match:
+                        command = match.group(1).strip()
+                        print("command", command)
+                        bash_tool = tool_collection.tool_map.get("bash")
+                        if bash_tool:
+                            result = await bash_tool(command=command)
+                            tool_id = f"toolu_bash"
+                            tool_result = BetaToolResultBlockParam(
+                                tool_use_id=tool_id,
+                                type="tool_result",
+                                content=result.output if result.output else result.error,
+                                is_error=bool(result.error),
+                            )
+                            tool_output_callback(result, tool_id)
+                            messages.append({"role": "user", "content": [tool_result]})
 
+                    return messages
             except Exception as e:
                 api_response_callback(None, None, e)
                 return messages
