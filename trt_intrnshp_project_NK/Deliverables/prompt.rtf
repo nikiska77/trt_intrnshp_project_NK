@@ -1,0 +1,17 @@
+prompt = """Analyze the web page at http://localhost:8000 for bugs. Steps:\
+1. Fetch page content using fetch_webpage\
+2. Identify 1 visual and 1 functional bug\
+3. Return findings in JSON format with fixes\
+\
+Expected format:\
+```json\
+\{\
+    "bugs": [\
+        \{\
+            "type": "visual|functional",\
+            "description": "Bug description",\
+            "fix": "How to fix it"\
+        \}\
+    ]\
+\}\
+```"""}
